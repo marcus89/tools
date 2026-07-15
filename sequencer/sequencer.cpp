@@ -148,116 +148,197 @@ void seek_midi(double jack_tick)
     cout << "Event index for tick " << std::to_string(jack_to_midi_tick) << " is " << std::to_string(event_index) << endl;
 }
 
-void seek_midi_nframes(jack_position_t pos,jack_nframes_t frames){
+void seek_midi(jack_position_t pos)
+{
     event_index = 0;
 
-    // convert jack tick to midi tick
-    double current_total_jack_ticks = (pos.beat - 1) * pos.ticks_per_beat + pos.tick;
-    // this means where have just started the master
+    // locate from jack BBT on current bar
+    double current_jack_ticks = (pos.beat - 1) * pos.ticks_per_beat + pos.tick;
 
-    printf("JACK offset %d beat: %d, tick:%d => %f\n",pos.bbt_offset, pos.beat, pos.tick, current_total_jack_ticks);
+    // convert jack midi tick_per_beat -> midifile tick_per_beat
+    double current_midi_ticks = current_jack_ticks * midifile.getTicksPerQuarterNote() / pos.ticks_per_beat;
+    printf("Seeking jack: %f midi:%f\n", current_jack_ticks, current_midi_ticks);
 
-    // jack frame per tick
-    double jack_frame_per_tick = frame_per_beat / pos.ticks_per_beat;
-    double frame_of_bar_start = pos.frame - current_total_jack_ticks * jack_frame_per_tick;
-    printf("JACK : current bar: %d beat:%d tick: %d\n", pos.bar,pos.beat, pos.tick);
-    printf("JACK started at %f\n", frame_of_bar_start);
+    // // jack frame per tick
+    // double jack_frame_per_tick = frame_per_beat / pos.ticks_per_beat;
+    // double frame_of_bar_start = pos.frame - current_total_jack_ticks * jack_frame_per_tick;
+    // printf("JACK : current bar: %d beat:%d tick: %d\n", pos.bar, pos.beat, pos.tick);
+    // printf("JACK started at %f\n", frame_of_bar_start);
 
-    double jack_to_midi_ticks = current_total_jack_ticks * midifile.getTicksPerQuarterNote() / pos.ticks_per_beat;
+    // double jack_to_midi_ticks = current_total_jack_ticks * midifile.getTicksPerQuarterNote() / pos.ticks_per_beat;
     for (int event = 0; event < midifile[1].size(); event++)
     {
         if (!midifile[1][event].isNoteOn())
             continue;
 
-        if (midifile[1][event].tick >= jack_to_midi_ticks)
+        if (midifile[1][event].tick >= current_midi_ticks)
         {
             event_index = event;
             break;
         }
     }
 
-    printf("bar: %d beat:%d tick:%d\n", pos.bar, pos.beat, pos.tick);
-    printf("Finding event based on midi tick: %f => event at index: %d\n", jack_to_midi_ticks, event_index);
+    // printf("bar: %d beat:%d tick:%d\n", pos.bar, pos.beat, pos.tick);
+    printf("Finding event based on midi tick: %f => event at index: %d\n", current_jack_ticks, event_index);
 }
 
-int process_callback(jack_nframes_t nframes, void *arg)
+bool init = false;
+int process_on_beat(jack_nframes_t nframes, void *)
 {
 
-    if (m_midi_state == STOPPED)
+    jack_position_t pos;
+
+    jack_transport_state_t state = jack_transport_query(m_jack_client, &pos);
+
+    if (state != JackTransportRolling || !(pos.valid & JackPositionBBT))
     {
         return 0;
     }
 
-    void *port_buf = jack_port_get_buffer(m_midi_output_port, nframes);
-    unsigned char *buffer;
-    jack_midi_clear_buffer(port_buf);
+    jack_midi_clear_buffer( jack_port_get_buffer(m_midi_output_port, nframes));
 
-    jack_transport_state_t transport_state;
-    jack_position_t transport_pos;
-    transport_state = jack_transport_query(m_jack_client, &transport_pos);
+    void *buffer = jack_port_get_buffer(m_midi_output_port, nframes);
 
-    if (transport_state != JackTransportRolling)
+    if(!init){
+        seek_midi(pos);
+        init = true;
+    }
+    /*
+     * Convert JACK BBT to tick position
+     */
+
+    double ticks_per_frame = (pos.beats_per_minute * pos.ticks_per_beat) / (pos.frame_rate * 60.0);
+    double current_tick = ((double)(pos.bar - 1) * pos.beats_per_bar * pos.ticks_per_beat) + ((double)(pos.beat - 1) * pos.ticks_per_beat) + pos.tick_double;
+    /*
+     * Find next beat tick
+     */
+
+    double next_beat_tick = ceil(current_tick / pos.ticks_per_beat) * pos.ticks_per_beat;
+    /*
+     * Avoid triggering the current beat twice
+     */
+
+    if (fabs(next_beat_tick - current_tick) < 0.001)
     {
-        return 0;
+        printf("ok\n");
+        next_beat_tick += pos.ticks_per_beat;
     }
 
-    if (!(transport_pos.valid & JackPositionBBT))
+    /*
+     * Convert next beat tick to frame
+     */
+
+    double frames_until_beat = (next_beat_tick - current_tick) / ticks_per_frame;
+    int64_t beat_frame = pos.frame + llround(frames_until_beat); // this is the offset!
+
+    /*
+     * Is the beat inside this JACK period?
+     */
+
+    int64_t offset = beat_frame - pos.frame;
+
+    if (offset >= 0 && offset < nframes)
     {
-        return 0;
+        uint8_t note_on[3] =
+            {
+                0x90 + pos.beat % 4, // note on channel 1
+                60,                  // C4
+                100};
+
+        jack_midi_event_write(
+            buffer,
+            offset,
+            note_on,
+            sizeof(note_on));
+
+        printf("Beat %d tick:%f MIDI %d at frame=%ld offset=%ld\n",
+               pos.beat, pos.tick_double, (pos.beat % 4) + 1, beat_frame,
+               offset);
     }
 
-    update_bpm(&transport_pos);
-
-    // get current frame position
-    jack_nframes_t frame_time = transport_pos.frame;
-
-    while (1)
-    {
-        // start the reading
-        if (m_midi_state == SYNC_REQUESTED)
-        {
-            seek_midi_nframes(transport_pos, frame_time);
-            m_midi_state = PLAYING;
-            printf("-------------\n");
-            // break;
-        }
-        // break;
-
-        MidiEvent &msg = midifile[1][event_index];
-        if (!msg.isNoteOn()){
-            event_index++;
-            if(event_index >= midifile[1].getEventCount()){
-                event_index = 0;
-            }
-            continue;
-        }
-        double event_frame = msg.tick * frame_per_tick;
-        double f = frame_time % m_frame_per_bar;
-
-        m_offset = abs(event_frame - f);
-        if (m_offset + nframes > m_frame_per_bar)
-        {
-            m_offset = m_frame_per_bar - m_offset;
-        }
-
-        if (m_offset >= nframes)
-        {
-            return 0;
-        }
-
-        msg.setChannel(event_index/2);
-        printf("Sending event %d on bar:%d beat: %d tick:%d foffset %d\n", event_index, transport_pos.bar, transport_pos.beat, transport_pos.tick, m_offset);
-        jack_midi_event_write(port_buf, (jack_nframes_t)m_offset, msg.data(), msg.size());
-
-        event_index++;
-        if (event_index >= midifile[1].getEventCount())
-        {
-            cout << "reset" << endl;
-            event_index = 0;
-        }
-    }
     return 0;
 }
+
+// int process_callback(jack_nframes_t nframes, void *arg)
+// {
+
+//     if (m_midi_state == STOPPED)
+//     {
+//         return 0;
+//     }
+
+//     void *port_buf = jack_port_get_buffer(m_midi_output_port, nframes);
+//     unsigned char *buffer;
+//     jack_midi_clear_buffer(port_buf);
+
+//     jack_transport_state_t transport_state;
+//     jack_position_t transport_pos;
+//     transport_state = jack_transport_query(m_jack_client, &transport_pos);
+
+//     if (transport_state != JackTransportRolling)
+//     {
+//         return 0;
+//     }
+
+//     if (!(transport_pos.valid & JackPositionBBT))
+//     {
+//         return 0;
+//     }
+
+//     update_bpm(&transport_pos);
+
+//     // get current frame position
+//     jack_nframes_t frame_time = transport_pos.frame;
+
+//     while (1)
+//     {
+//         // start the reading
+//         if (m_midi_state == SYNC_REQUESTED)
+//         {
+//             seek_midi_nframes(transport_pos, frame_time);
+//             m_midi_state = PLAYING;
+//             printf("-------------\n");
+//             // break;
+//         }
+//         // break;
+
+//         MidiEvent &msg = midifile[1][event_index];
+//         if (!msg.isNoteOn())
+//         {
+//             event_index++;
+//             if (event_index >= midifile[1].getEventCount())
+//             {
+//                 event_index = 0;
+//             }
+//             continue;
+//         }
+//         double event_frame = msg.tick * frame_per_tick;
+//         double f = frame_time % m_frame_per_bar;
+
+//         m_offset = abs(event_frame - f);
+//         if (m_offset + nframes > m_frame_per_bar)
+//         {
+//             m_offset = m_frame_per_bar - m_offset;
+//         }
+
+//         if (m_offset >= nframes)
+//         {
+//             return 0;
+//         }
+
+//         msg.setChannel(event_index / 2);
+//         printf("Sending event %d on bar:%d beat: %d tick:%d foffset %d\n", event_index, transport_pos.bar, transport_pos.beat, transport_pos.tick, m_offset);
+//         jack_midi_event_write(port_buf, (jack_nframes_t)m_offset, msg.data(), msg.size());
+
+//         event_index++;
+//         if (event_index >= midifile[1].getEventCount())
+//         {
+//             cout << "reset" << endl;
+//             event_index = 0;
+//         }
+//     }
+//     return 0;
+// }
 
 // jack_nframes_t next_beat_frame = 0;
 // bool initialized = false;
@@ -390,7 +471,6 @@ int process_callback(jack_nframes_t nframes, void *arg)
 //     jack_nframes_t jack_end =
 //         jack_start + nframes;
 
-
 //     if (event_index >= midifile[1].size())
 //         event_index = 0;
 
@@ -411,12 +491,10 @@ int process_callback(jack_nframes_t nframes, void *arg)
 //                 +
 //                 pos.tick;
 
-
 //             double midi_tick =
 //                 jack_tick *
 //                 midi_tpq /
 //                 pos.ticks_per_beat;
-
 
 //             midi_tick = fmod(midi_tick, 768);
 
@@ -659,19 +737,19 @@ int start(void)
         return -1;
     }
 
-    err = jack_set_process_callback(m_jack_client, process_callback, NULL);
+    err = jack_set_process_callback(m_jack_client, process_on_beat, NULL);
     if (err)
     {
         std::cout << "Could not register JACK process callback." << std::endl;
         return -1;
     }
 
-    err = jack_set_timebase_callback(m_jack_client, 0, timebase_callback, NULL);
-    if (err)
-    {
-        std::cout << "Could not register JACK timebase callback %d." << std::endl;
-        return -1;
-    }
+    // err = jack_set_timebase_callback(m_jack_client, 0, timebase_callback, NULL);
+    // if (err)
+    // {
+    //     std::cout << "Could not register JACK timebase callback %d." << std::endl;
+    //     return -1;
+    // }
 
     err = jack_set_port_registration_callback(m_jack_client, port_registration_callback, NULL);
     if (err)
@@ -695,8 +773,8 @@ int start(void)
 
     connect_ports();
 
-    jack_transport_locate(m_jack_client, 0);
-    jack_transport_start(m_jack_client);
+    // jack_transport_locate(m_jack_client, 0);
+    // jack_transport_start(m_jack_client);
 
     return 0;
 }
